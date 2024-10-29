@@ -1,0 +1,159 @@
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.util.Collector;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.ProducerConfig;
+
+import java.time.Duration;
+import java.util.Properties;
+
+// Define Packet and PacketType classes
+class Packet {
+    String requestId;
+    String finalStatus;
+    PacketType packetType;
+
+    // getters, setters, and constructor
+}
+
+class PacketType {
+    String packetName;
+    String packetType;
+
+    // getters, setters, and constructor
+}
+
+// Custom sink for HTTP client publishing
+class HttpSink implements SinkFunction<Packet> {
+    @Override
+    public void invoke(Packet packet, Context context) {
+        // Implement HTTP client publishing logic here
+    }
+}
+
+public class PacketProcessingJob {
+    public static void main(String[] args) throws Exception {
+        // Set up execution environment
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        ParameterTool params = ParameterTool.fromArgs(args);
+        env.getConfig().setGlobalJobParameters(params);
+
+        // Configure Kafka source
+        Properties kafkaProps = new Properties();
+        kafkaProps.setProperty(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, params.get("bootstrap.servers"));
+        kafkaProps.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "packet-group");
+
+        FlinkKafkaConsumer<Packet> kafkaSource = new FlinkKafkaConsumer<>(
+                params.get("input.topic"),
+                new PacketDeserializationSchema(),
+                kafkaProps
+        );
+        kafkaSource.assignTimestampsAndWatermarks(WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5)));
+
+        // Define the data stream
+        DataStream<Packet> packetStream = env.addSource(kafkaSource);
+
+        // Process and aggregate packets
+        DataStream<Packet> aggregatedStream = packetStream
+                .keyBy(packet -> packet.requestId)
+                .process(new PacketAggregationFunction());
+
+        // Sink for packets with final status (HTTP client sink)
+        aggregatedStream
+                .filter(packet -> packet.finalStatus != null)
+                .addSink(new HttpSink());
+
+        // Sink for packets that timeout (Kafka sink)
+        Properties kafkaSinkProps = new Properties();
+        kafkaSinkProps.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, params.get("bootstrap.servers"));
+        FlinkKafkaProducer<Packet> kafkaSink = new FlinkKafkaProducer<>(
+                params.get("timeout.topic"),
+                new PacketSerializationSchema(),
+                kafkaSinkProps,
+                FlinkKafkaProducer.Semantic.AT_LEAST_ONCE
+        );
+
+        aggregatedStream
+                .filter(packet -> packet.finalStatus == null)
+                .addSink(kafkaSink);
+
+        // Execute the Flink job
+        env.execute("Packet Processing Job");
+    }
+
+    // PacketAggregationFunction to aggregate packets by requestId
+    public static class PacketAggregationFunction extends KeyedProcessFunction<String, Packet, Packet> {
+        private transient ListState<Packet> packetState;
+        private transient ValueState<Long> timerState;
+
+        @Override
+        public void open(Configuration parameters) {
+            ListStateDescriptor<Packet> packetStateDescriptor = new ListStateDescriptor<>(
+                    "packetState",
+                    TypeInformation.of(Packet.class)
+            );
+            packetState = getRuntimeContext().getListState(packetStateDescriptor);
+
+            ValueStateDescriptor<Long> timerStateDescriptor = new ValueStateDescriptor<>(
+                    "timerState",
+                    Long.class
+            );
+            timerState = getRuntimeContext().getState(timerStateDescriptor);
+        }
+
+        @Override
+        public void processElement(Packet packet, Context ctx, Collector<Packet> out) throws Exception {
+            // Add incoming packet to state
+            packetState.add(packet);
+
+            // If finalStatus is present, set a 5-second timer
+            if (packet.finalStatus != null) {
+                long fiveSecondsLater = ctx.timestamp() + 5000;
+                ctx.timerService().registerEventTimeTimer(fiveSecondsLater);
+                timerState.update(fiveSecondsLater);
+            } else {
+                // If no final status, set a 10-minute timer if not already set
+                if (timerState.value() == null) {
+                    long tenMinutesLater = ctx.timestamp() + Duration.ofMinutes(10).toMillis();
+                    ctx.timerService().registerEventTimeTimer(tenMinutesLater);
+                    timerState.update(tenMinutesLater);
+                }
+            }
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<Packet> out) throws Exception {
+            if (timestamp == timerState.value()) {
+                // Aggregate packets
+                Packet finalPacket = aggregatePackets();
+
+                // Collect final packet for downstream sinks
+                out.collect(finalPacket);
+
+                // Clear state
+                packetState.clear();
+                timerState.clear();
+            }
+        }
+
+        private Packet aggregatePackets() throws Exception {
+            Packet aggregatedPacket = new Packet();
+            for (Packet packet : packetState.get()) {
+                // Implement aggregation logic based on packet properties
+            }
+            return aggregatedPacket;
+        }
+    }
+}
