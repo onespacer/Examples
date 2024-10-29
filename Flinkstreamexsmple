@@ -1,0 +1,161 @@
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.java.utils.ParameterTool;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaProducer;
+import org.apache.flink.util.Collector;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Properties;
+
+// Packet and PacketType classes
+class Packet {
+    String requestId;
+    String finalStatus; // null if not final, otherwise has a final status
+    PacketType packetType;
+
+    public Packet(String requestId, String finalStatus, PacketType packetType) {
+        this.requestId = requestId;
+        this.finalStatus = finalStatus;
+        this.packetType = packetType;
+    }
+
+    public boolean isFinal() {
+        return finalStatus != null;
+    }
+}
+
+class PacketType {
+    String packetName;
+    String packetType;
+
+    public PacketType(String packetName, String packetType) {
+        this.packetName = packetName;
+        this.packetType = packetType;
+    }
+}
+
+// Custom sink to send the aggregated result to an HTTP endpoint
+class HttpSink {
+    public static void sendData(Packet aggregatedPacket) {
+        // Code to publish aggregatedPacket to an HTTP endpoint.
+        // Use an HTTP client library (e.g., Apache HttpClient or OkHttp) for actual implementation.
+    }
+}
+
+public class PacketProcessingJob {
+
+    public static void main(String[] args) throws Exception {
+        // Set up Flink environment
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Parse command-line arguments
+        ParameterTool parameterTool = ParameterTool.fromArgs(args);
+        String kafkaBroker = parameterTool.get("kafkaBroker", "localhost:9092");
+        String inputTopic = parameterTool.get("inputTopic", "packet-topic");
+        String outputTopic = parameterTool.get("outputTopic", "timeout-packet-topic");
+
+        // Kafka consumer properties
+        Properties properties = new Properties();
+        properties.setProperty("bootstrap.servers", kafkaBroker);
+        properties.setProperty("group.id", "flink-packet-group");
+
+        // Define the Kafka source
+        FlinkKafkaConsumer<String> kafkaSource = new FlinkKafkaConsumer<>(
+                inputTopic,
+                new SimpleStringSchema(),
+                properties
+        );
+
+        // Watermark strategy for event-time handling
+        WatermarkStrategy<String> watermarkStrategy = WatermarkStrategy
+                .forBoundedOutOfOrderness(Duration.ofSeconds(5));
+
+        // Process the stream
+        DataStream<Packet> packetStream = env.addSource(kafkaSource)
+                .assignTimestampsAndWatermarks(watermarkStrategy)
+                .map(value -> parsePacket(value)); // Convert from String to Packet object
+
+        // Key by requestId and aggregate based on final status
+        packetStream
+                .keyBy(packet -> packet.requestId)
+                .process(new PacketAggregator(outputTopic, 10 * 60 * 1000L, 5 * 1000L));
+
+        // Execute the Flink job
+        env.execute("Packet Processing Job");
+    }
+
+    private static Packet parsePacket(String value) {
+        // Implement JSON parsing logic here to convert value to a Packet object
+        return new Packet("exampleId", null, new PacketType("examplePacket", "exampleType"));
+    }
+
+    // KeyedProcessFunction to aggregate packets
+    public static class PacketAggregator extends KeyedProcessFunction<String, Packet, Void> {
+
+        private final String timeoutOutputTopic;
+        private final long timeoutDuration;
+        private final long outOfOrderWaitingDuration;
+
+        // State to hold the list of packets for each requestId
+        private transient ArrayList<Packet> packetList;
+
+        public PacketAggregator(String timeoutOutputTopic, long timeoutDuration, long outOfOrderWaitingDuration) {
+            this.timeoutOutputTopic = timeoutOutputTopic;
+            this.timeoutDuration = timeoutDuration;
+            this.outOfOrderWaitingDuration = outOfOrderWaitingDuration;
+        }
+
+        @Override
+        public void open(org.apache.flink.configuration.Configuration parameters) throws Exception {
+            packetList = new ArrayList<>();
+        }
+
+        @Override
+        public void processElement(Packet packet, Context ctx, Collector<Void> out) throws Exception {
+            packetList.add(packet);
+
+            if (packet.isFinal()) {
+                // Set a timer to wait for out-of-order packets after final status is received
+                ctx.timerService().registerEventTimeTimer(ctx.timestamp() + outOfOrderWaitingDuration);
+            } else {
+                // Set a timeout timer if we haven't seen a final packet within the allowed time
+                ctx.timerService().registerEventTimeTimer(ctx.timestamp() + timeoutDuration);
+            }
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<Void> out) throws Exception {
+            // Check if the packet contains the final status
+            boolean hasFinalStatus = packetList.stream().anyMatch(Packet::isFinal);
+
+            if (hasFinalStatus) {
+                // Send aggregated packets to HTTP sink
+                Packet aggregatedPacket = aggregatePackets(packetList);
+                HttpSink.sendData(aggregatedPacket);
+            } else {
+                // Timeout reached without final status - send to Kafka topic
+                FlinkKafkaProducer<String> kafkaSink = new FlinkKafkaProducer<>(
+                        timeoutOutputTopic,
+                        new SimpleStringSchema(),
+                        new Properties()
+                );
+                String aggregatedResult = aggregatePackets(packetList).toString();
+                kafkaSink.invoke(aggregatedResult, ctx);
+            }
+
+            // Clear the state for the next aggregation
+            packetList.clear();
+        }
+
+        private Packet aggregatePackets(ArrayList<Packet> packets) {
+            // Aggregate logic, possibly combining fields, handling duplicates, etc.
+            // Here we just return the first packet for simplicity.
+            return packets.get(0);
+        }
+    }
+}
